@@ -871,11 +871,8 @@ class _EntraOBOToken(Dependency[str]):
     async def __aenter__(self) -> str:
         _require_azure_identity("EntraOBOToken")
 
-        from fastmcp.server.dependencies import (
-            get_access_token,
-            get_http_request,
-            get_server,
-        )
+        from fastmcp.server.auth._context import _get_effective_auth
+        from fastmcp.server.dependencies import get_access_token
 
         access_token = get_access_token()
         if access_token is None:
@@ -883,16 +880,7 @@ class _EntraOBOToken(Dependency[str]):
                 "No access token available. Cannot perform OBO exchange."
             )
 
-        auth = get_server().auth
-        try:
-            request = get_http_request()
-        except RuntimeError:
-            # Non-HTTP callers use the current server's provider.
-            pass
-        else:
-            app_state = getattr(request.scope.get("app"), "state", None)
-            # An explicit None disables auth for this app; do not fall back.
-            auth = getattr(app_state, "fastmcp_auth", auth)
+        auth = _get_effective_auth()
         azure_provider = _find_azure_provider(auth)
         if azure_provider is None:
             raise RuntimeError(
@@ -916,8 +904,10 @@ def EntraOBOToken(scopes: list[str]) -> str:
     behalf of the authenticated user.
 
     HTTP requests use the serving app's authentication provider, including an
-    override passed to `http_app(auth=...)`. Without an HTTP request, the
-    current server's provider is used.
+    override passed to `http_app(auth=...)`, only for tools owned by that app's
+    server. Mounted tools use their own server's provider. Background tasks
+    retain this selection; remote workers must construct the same app auth
+    configuration. Other non-HTTP calls use the current server's provider.
 
     Args:
         scopes: The scopes to request for the downstream API. For Microsoft Graph,

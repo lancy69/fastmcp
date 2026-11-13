@@ -12,25 +12,26 @@ Two architectural notes vs. SEP-1686:
   so for a tasked call only the root's middleware wraps submission (the tool
   body runs later in the worker). Child/grandchild middleware do not wrap a
   tasked submission.
-- Worker server resolution is single-level: a tool reached through nested mounts
-  resolves to the outermost mounted child (the mount point the call arrived
-  through), which still reaches deeper components via its own mounts.
+- Worker server resolution follows nested mounts to the tool's owning server, so
+  dependencies use the leaf server's configuration even in a separate worker.
 """
 
 from __future__ import annotations
 
 import asyncio
+import weakref
 from typing import cast
 
 import mcp_types as mt
 import pytest
 from docket import Docket
+from fastmcp_tasks.context import TaskContextSnapshot, _resolve_owning_server
 from fastmcp_tasks.dependencies import CurrentDocket
 from mcp_types import Tool as MCPTool
 from mcp_types import ToolExecution
 
 from fastmcp import Context, FastMCP
-from fastmcp.server.dependencies import CurrentFastMCP
+from fastmcp.server.dependencies import CurrentFastMCP, _current_server
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.server.providers.proxy import ClientFactoryT, ProxyTool
 from fastmcp.tools.base import ToolResult
@@ -195,6 +196,21 @@ class TestRemoteWorkerServerResolution:
             )
             assert resolved_v1 is child_v1
             assert resolved_v2 is child_v2
+        finally:
+            _current_server.reset(token)
+
+    async def test_resolve_owning_server_recovers_nested_child(self, child_server):
+        middle = FastMCP("middle-server")
+        middle.mount(child_server, namespace="leaf")
+        root = FastMCP("root-server")
+        root.mount(middle, namespace="middle")
+
+        token = _current_server.set(weakref.ref(root))
+        try:
+            resolved = await _resolve_owning_server(
+                TaskContextSnapshot(owning_tool_name="middle_leaf_multiply")
+            )
+            assert resolved is child_server
         finally:
             _current_server.reset(token)
 

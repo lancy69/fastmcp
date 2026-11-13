@@ -27,6 +27,7 @@ from starlette.routing import BaseRoute, Mount, Route
 from starlette.types import ASGIApp, Lifespan, Receive, Scope, Send
 
 from fastmcp.server.auth import AuthProvider
+from fastmcp.server.auth._context import _register_auth_provider
 from fastmcp.server.auth.middleware import RequireAuthMiddleware
 from fastmcp.server.session_scoped_event_store import SessionScopedEventStore
 from fastmcp.utilities.logging import get_logger
@@ -623,6 +624,7 @@ def create_sse_app(
     # Store the FastMCP server instance on the Starlette app state
     app.state.fastmcp_server = server
     app.state.fastmcp_auth = auth
+    _register_auth_provider(server, auth)
     app.state.path = sse_path
     app.state.transport_type = "sse"
 
@@ -798,6 +800,7 @@ def create_streamable_http_app(
     # Store the FastMCP server instance on the Starlette app state
     app.state.fastmcp_server = server
     app.state.fastmcp_auth = auth
+    _register_auth_provider(server, auth)
     app.state.path = streamable_http_path
     app.state.transport_type = "streamable-http"
 

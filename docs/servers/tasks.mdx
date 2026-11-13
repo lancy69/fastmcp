@@ -289,6 +289,14 @@ Additional workers only work with Redis/Valkey backends. The in-memory backend i
 Task-enabled tools must be defined at server startup to be registered with all workers. Tools added dynamically after the server starts will not be available for background execution.
 </Warning>
 
+### Authentication provider configuration
+
+Configure the same authentication providers and mounted server tree in every worker. Provider-dependent dependencies such as [`EntraOBOToken`](/integrations/azure#entraobotoken-dependency) use the provider selected when the task was submitted, not a worker's unrelated default.
+
+If you configure authentication with `FastMCP(auth=provider)`, loading the same server module supplies that provider to the worker. If you instead pass `auth=provider` to `http_app()`, construct the equivalent `mcp.http_app(auth=provider)` in the module the worker loads. Keep that construction outside an `if __name__ == "__main__"` block. Constructing the app registers its provider with that FastMCP instance; the worker does not need to serve the HTTP app.
+
+The task snapshot stores a stable, nonsecret reference to the configured provider, not the provider object or its client secret. Each worker loads its own credentials, so client-secret rotation does not require copying the submitting process's objects. If the worker has no matching provider binding, the dependency fails rather than using another provider. Explicit `auth=None` remains disabled, and a mounted child's provider remains independent of its parent's HTTP app override.
+
 ## Gathering Input Mid-Task
 
 A tool can ask the client a question partway through — the same [guard pattern](/servers/elicitation#elicitation-on-the-modern-protocol) used for multi-round-trip input on foreground calls: instead of awaiting a response, the tool *returns* one, and FastMCP re-runs it once the client answers.

@@ -95,7 +95,8 @@ async def create_task(
     # Resolve mounted tasks to the owning (child) server in the worker, so
     # CurrentFastMCP()/ctx.fastmcp inside the task point at the server the tool
     # lives on rather than the root the interceptor ran on (#3571).
-    register_task_server(task_id, _owning_server(tool, context.fastmcp))
+    owning_server = await _owning_server(tool, context.fastmcp)
+    register_task_server(task_id, owning_server)
 
     key = component.key
     task_key = build_task_key(task_scope, task_id, "tool", key)
@@ -110,7 +111,9 @@ async def create_task(
     poll_interval_key = docket.key(f"{prefix}:{task_id}:poll_interval")
 
     snapshot = TaskContextSnapshot.capture(
-        owning_tool_name=tool.name, owning_tool_version=tool.version
+        owning_tool_name=tool.name,
+        owning_tool_version=tool.version,
+        owning_server=owning_server,
     )
 
     async with docket.redis() as redis:
@@ -143,22 +146,17 @@ async def create_task(
     )
 
 
-def _owning_server(tool: Tool, fallback: FastMCP) -> FastMCP:
-    """The server a mounted tool lives on, for worker context resolution.
-
-    A mounted tool is a ``FastMCPProviderTool`` that references the child server
-    it came from, so ``CurrentFastMCP()``/``ctx.fastmcp`` inside the task point at
-    that server rather than the root the interceptor ran on (#3571). Resolution
-    is single-level: a tool reached through several nested mounts resolves to the
-    outermost mounted child (the mount point the call arrived through), which
-    still reaches deeper components through its own mounts. A non-mounted tool
-    falls back to the server the call arrived on.
-    """
+async def _owning_server(tool: Tool, fallback: FastMCP) -> FastMCP:
+    """Follow mounted tool delegation to the server that executes its body."""
     from fastmcp.server.providers.fastmcp_provider import FastMCPProviderTool
+    from fastmcp.utilities.versions import VersionSpec
 
-    if isinstance(tool, FastMCPProviderTool):
-        return tool._server
-    return fallback
+    server = fallback
+    while isinstance(tool, FastMCPProviderTool):
+        server = tool._server
+        version = VersionSpec(eq=tool.version) if tool.version else None
+        tool = await server.get_tool(tool._original_name or tool.name, version)
+    return server
 
 
 async def registered_component_for_key(server: FastMCP, component_key: str) -> Tool:

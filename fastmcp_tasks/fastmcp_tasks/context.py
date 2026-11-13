@@ -169,12 +169,15 @@ class TaskContextSnapshot:
     session_id: str | None = None
     owning_tool_name: str | None = None
     owning_tool_version: str | None = None
+    auth_provider_ref: str | None = None
+    """Configured provider identity; None preserves legacy server-default selection."""
 
     @classmethod
     def capture(
         cls,
         owning_tool_name: str | None = None,
         owning_tool_version: str | None = None,
+        owning_server: FastMCP | None = None,
     ) -> TaskContextSnapshot:
         """Capture current context for background task execution.
 
@@ -184,7 +187,16 @@ class TaskContextSnapshot:
         server from this name and version against the root — see
         ``make_task_context``. The version matters when two versions of the same
         mounted tool name live on different child servers.
+
+        ``owning_server`` is resolved before capture because the task interceptor
+        runs on the root, but a mounted tool's auth belongs to its leaf server.
+        Only a nonsecret configured-provider reference is serialized; the worker
+        resolves it against its own server and HTTP app configuration.
         """
+        from fastmcp.server.auth._context import (
+            _auth_provider_ref,
+            _get_effective_auth,
+        )
         from fastmcp.server.dependencies import (
             get_access_token,
             get_context,
@@ -209,6 +221,9 @@ class TaskContextSnapshot:
             session_id=session_id,
             owning_tool_name=owning_tool_name,
             owning_tool_version=owning_tool_version,
+            auth_provider_ref=_auth_provider_ref(
+                _get_effective_auth(owning_server or ctx.fastmcp)
+            ),
         )
 
     @classmethod
@@ -227,6 +242,7 @@ class TaskContextSnapshot:
             session_id=parsed.get("session_id"),
             owning_tool_name=parsed.get("owning_tool_name"),
             owning_tool_version=parsed.get("owning_tool_version"),
+            auth_provider_ref=parsed.get("auth_provider_ref"),
         )
 
     def to_json(self) -> str:
@@ -239,6 +255,7 @@ class TaskContextSnapshot:
                 "session_id": self.session_id,
                 "owning_tool_name": self.owning_tool_name,
                 "owning_tool_version": self.owning_tool_version,
+                "auth_provider_ref": self.auth_provider_ref,
             }
         )
 
@@ -328,8 +345,19 @@ async def restore_task_snapshot(key: str = TaskKey()) -> None:
         # Non-fastmcp key (e.g. docket scheduler internals) — nothing to do.
         return
 
+    from fastmcp.server.auth._context import (
+        _background_task_auth_context,
+        _background_task_auth_owner,
+        _background_task_auth_provider,
+    )
     from fastmcp.server.dependencies import get_server
     from fastmcp_tasks.dependencies import _current_docket
+
+    # A missing snapshot must not retain an earlier task's provider selection.
+    _background_task_auth_provider.set(None)
+    _background_task_auth_owner.set(None)
+    _background_task_auth_context.set(None)
+    _task_snapshot.set(None)
 
     # Resolved before anything can fail: a misconfigured key (e.g. an empty
     # string) raises here and fails the task, and the branches below read
@@ -368,6 +396,13 @@ async def restore_task_snapshot(key: str = TaskKey()) -> None:
         # get_access_token()/get_http_headers() see the submitting caller inside
         # the worker, exactly as a normal request would.
         _apply_snapshot_to_context(snapshot)
+        # Resolve before user dependencies (including OBO) run, even when the
+        # tool does not request a Context parameter.
+        server = get_task_server(task_id)
+        if server is None:
+            server = await _resolve_owning_server(snapshot) or get_server()
+            register_task_server(task_id, server)
+        _background_task_auth_owner.set(server)
     except SnapshotDecryptionError:
         # Docket reports this to the client as a generic dependency-resolution
         # failure, so name the cause here. A key mismatch across servers and
@@ -516,6 +551,7 @@ async def _resolve_owning_server(
     from fastmcp.server.dependencies import get_server
     from fastmcp.server.providers.fastmcp_provider import FastMCPProviderTool
     from fastmcp.utilities.versions import VersionSpec
+    from fastmcp_tasks.creation import _owning_server
 
     root = get_server()
     # Resolve the exact version the call targeted: two versions of the same
@@ -531,7 +567,7 @@ async def _resolve_owning_server(
     except NotFoundError:
         return None
     if isinstance(tool, FastMCPProviderTool):
-        return tool._server
+        return await _owning_server(tool, root)
     return None
 
 
@@ -548,10 +584,10 @@ def _apply_snapshot_to_context(snapshot: TaskContextSnapshot) -> None:
     ``restore_task_snapshot`` (a Docket dependency), whose context vars propagate
     to the tool the same way the snapshot var already does.
 
-    Both vars are set unconditionally to *this* snapshot's state (``None`` when
-    it carries no token/headers), never left as-is: a Docket worker may reuse an
-    asyncio context across tasks, so an anonymous task following an authenticated
-    one must not inherit the prior caller's identity or headers.
+    Context fields are set unconditionally to *this* snapshot's state, never
+    left as-is: a Docket worker may reuse an asyncio context across tasks, so an
+    anonymous task following an authenticated one must not inherit the prior
+    caller's identity, headers, session ID, or provider binding.
     """
     import time
 
@@ -559,10 +595,31 @@ def _apply_snapshot_to_context(snapshot: TaskContextSnapshot) -> None:
     from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 
     from fastmcp.server.auth import AccessToken
+    from fastmcp.server.auth._context import (
+        _background_task_auth_context,
+        _background_task_auth_owner,
+        _background_task_auth_provider,
+    )
     from fastmcp.server.dependencies import (
         _background_task_headers,
         _background_task_session_id,
+        get_context,
+        get_server,
     )
+
+    # Set before parsing the token: failed restoration must never select some
+    # other configured provider through the legacy snapshot fail-open path.
+    _background_task_auth_provider.set(snapshot.auth_provider_ref)
+    _background_task_auth_owner.set(None)
+    try:
+        _background_task_auth_context.set(get_context())
+    except RuntimeError:
+        _background_task_auth_context.set(None)
+    if snapshot.auth_provider_ref is not None:
+        try:
+            _background_task_auth_owner.set(get_server())
+        except RuntimeError:
+            pass
 
     user: AuthenticatedUser | None = None
     if snapshot.access_token_json is not None:

@@ -11,9 +11,11 @@ the edge cases around non-fastmcp keys and failed restores.
 from __future__ import annotations
 
 import contextvars
+import weakref
 from unittest.mock import patch
 
 import pytest
+from docket import Docket
 from fastmcp_tasks.context import (
     TaskContextSnapshot,
     _apply_snapshot_to_context,
@@ -21,12 +23,21 @@ from fastmcp_tasks.context import (
     get_task_context,
     restore_task_snapshot,
 )
+from fastmcp_tasks.dependencies import _current_docket
+from fastmcp_tasks.keys import build_task_key
 from mcp.server.auth.middleware.auth_context import auth_context_var
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 
 from fastmcp import FastMCP
 from fastmcp.server.auth import AccessToken
-from fastmcp.server.dependencies import get_access_token, get_http_headers
+from fastmcp.server.auth._context import _auth_provider_ref, _get_effective_auth
+from fastmcp.server.auth.providers.jwt import JWTVerifier
+from fastmcp.server.dependencies import (
+    _current_server,
+    get_access_token,
+    get_http_headers,
+    get_http_request,
+)
 from fastmcp_tasks import TasksExtension
 from tests.tasks.task_helpers import (
     running_task_server,
@@ -127,8 +138,6 @@ def test_apply_snapshot_headers_without_faking_a_request():
     background task, and impersonating one would make `CurrentRequest()` expose
     invented method/URL/client data.
     """
-    from fastmcp.server.dependencies import get_http_request
-
     snapshot = TaskContextSnapshot(http_headers={"x-trace-id": "abc123"})
 
     def run_in_clean_worker_context() -> None:
@@ -229,3 +238,79 @@ async def test_restore_skipped_for_non_fastmcp_task_keys():
     await restore_task_snapshot(key="not-a-fastmcp-key")
     await restore_task_snapshot(key="weird:client-a:task-1:tool:my_tool")
     await restore_task_snapshot(key="")
+
+
+@pytest.mark.parametrize("binding", ["configured", "disabled", "missing"])
+def test_apply_snapshot_resolves_provider_from_rebuilt_worker(binding: str) -> None:
+    submitted_auth = JWTVerifier(jwks_uri="https://app.example.com/keys")
+    provider_ref = (
+        "none" if binding == "disabled" else _auth_provider_ref(submitted_auth)
+    )
+    serialized = TaskContextSnapshot(auth_provider_ref=provider_ref).to_json()
+    del submitted_auth
+
+    default_auth = JWTVerifier(jwks_uri="https://default.example.com/keys")
+    worker = FastMCP("rebuilt-worker", auth=default_auth)
+    worker_auth = JWTVerifier(jwks_uri="https://app.example.com/keys")
+    if binding == "configured":
+        worker.http_app(auth=worker_auth)
+
+    def restore_in_new_process_context() -> None:
+        _current_server.set(weakref.ref(worker))
+        assert get_access_token() is None
+        with pytest.raises(RuntimeError):
+            get_http_request()
+        _apply_snapshot_to_context(TaskContextSnapshot.from_json(serialized))
+        if binding == "missing":
+            with pytest.raises(RuntimeError, match="authentication provider binding"):
+                _get_effective_auth(worker)
+        else:
+            expected = worker_auth if binding == "configured" else None
+            assert _get_effective_auth(worker) is expected
+        with pytest.raises(RuntimeError):
+            get_http_request()
+
+    contextvars.Context().run(restore_in_new_process_context)
+
+
+def test_apply_snapshot_clears_prior_provider_binding() -> None:
+    default_auth = JWTVerifier(jwks_uri="https://default.example.com/keys")
+    worker = FastMCP("reused-worker", auth=default_auth)
+    app_auth = JWTVerifier(jwks_uri="https://app.example.com/keys")
+    worker.http_app(auth=app_auth)
+    overridden = TaskContextSnapshot(auth_provider_ref=_auth_provider_ref(app_auth))
+
+    def restore_in_reused_context() -> None:
+        _current_server.set(weakref.ref(worker))
+        _apply_snapshot_to_context(overridden)
+        assert _get_effective_auth(worker) is app_auth
+        _apply_snapshot_to_context(TaskContextSnapshot(auth_provider_ref="none"))
+        assert _get_effective_auth(worker) is None
+        _apply_snapshot_to_context(TaskContextSnapshot.from_json("{}"))
+        assert _get_effective_auth(worker) is default_auth
+
+    contextvars.Context().run(restore_in_reused_context)
+
+
+async def test_restore_missing_snapshot_clears_prior_provider_binding() -> None:
+    default_auth = JWTVerifier(jwks_uri="https://default.example.com/keys")
+    worker = FastMCP("missing-snapshot-worker", auth=default_auth)
+    app_auth = JWTVerifier(jwks_uri="https://app.example.com/keys")
+    worker.http_app(auth=app_auth)
+
+    async with Docket(url="memory://") as docket:
+        marker = _current_server.set(weakref.ref(worker))
+        docket_marker = _current_docket.set(docket)
+        try:
+            _apply_snapshot_to_context(
+                TaskContextSnapshot(auth_provider_ref=_auth_provider_ref(app_auth))
+            )
+            assert _get_effective_auth(worker) is app_auth
+            await restore_task_snapshot(
+                key=build_task_key(None, "missing-snapshot", "tool", "tool:missing")
+            )
+            assert _get_effective_auth(worker) is default_auth
+        finally:
+            _apply_snapshot_to_context(TaskContextSnapshot())
+            _current_server.reset(marker)
+            _current_docket.reset(docket_marker)

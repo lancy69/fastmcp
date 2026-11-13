@@ -477,6 +477,10 @@ async def get_recent_emails(
 
 The `graph_token` parameter receives a ready-to-use access token for Microsoft Graph. FastMCP handles the OBO exchange transparently—your function just uses the token to call the API.
 
+`EntraOBOToken` uses the authentication provider configured for the server that owns the tool. For that server's HTTP requests, an `auth=` override on `http_app()` takes precedence over `FastMCP(auth=...)`. Passing `auth=None` explicitly disables that provider; it does not fall back to the server's default. An override on a parent app does not replace a mounted child server's Azure provider.
+
+Background tasks use the same provider as foreground calls. If you run [additional workers](/servers/tasks#authentication-provider-configuration), configure the same providers in each worker, including any HTTP app overrides.
+
 <Warning>
 **Scope alignment is critical.** The scopes passed to `EntraOBOToken` must be a subset of the scopes in `additional_authorize_scopes`. If you request a scope during OBO that wasn't included in the initial authorization, the exchange will fail.
 </Warning>
